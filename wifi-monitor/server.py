@@ -2,12 +2,47 @@
 """Quién está en mi WiFi: escanea tu red local y muestra los dispositivos.
 Uso: python3 server.py   ->  abre http://localhost:8080
 Solo usa la librería estándar. Funciona en Linux, macOS y Windows."""
-import ipaddress, json, platform, re, socket, subprocess, threading, time
+import csv, io, ipaddress, json, os, platform, re, socket, subprocess, threading, time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8080
 IS_WIN = platform.system() == "Windows"
+OUI_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oui.csv")
+OUI_URL = "https://standards-oui.ieee.org/oui/oui.csv"
+# Respaldo mínimo si no hay internet para bajar la lista completa del IEEE
+BASIC_OUI = {"F0:18:98": "Apple", "3C:22:FB": "Apple", "A4:83:E7": "Apple",
+    "FC:A1:83": "Amazon", "44:65:0D": "Amazon", "B8:27:EB": "Raspberry Pi",
+    "DC:A6:32": "Raspberry Pi", "00:1A:11": "Google", "F4:F5:D8": "Google",
+    "28:6C:07": "Xiaomi", "64:09:80": "Xiaomi", "FC:F5:C4": "Espressif",
+    "24:0A:C4": "Espressif", "30:AE:A4": "Espressif", "00:50:56": "VMware"}
+oui = {}
+
+def load_oui():
+    """Carga la lista de fabricantes del IEEE (se descarga una vez y se guarda)."""
+    try:
+        if not os.path.exists(OUI_FILE):
+            req = urllib.request.Request(OUI_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                open(OUI_FILE, "wb").write(r.read())
+        with open(OUI_FILE, newline="", encoding="utf-8", errors="replace") as f:
+            for row in csv.reader(f):
+                if len(row) >= 3 and len(row[1]) == 6:
+                    h = row[1].upper()
+                    oui[f"{h[0:2]}:{h[2:4]}:{h[4:6]}"] = row[2].strip()
+    except Exception:
+        pass
+    for k, v in BASIC_OUI.items():
+        oui.setdefault(k, v)
+
+def vendor(mac):
+    if not mac or mac[0] == "(":
+        return ""
+    if mac[1] in "26ae":
+        return "Aleatoria (privada)"
+    return oui.get(mac[:8].upper(), "Desconocido")
+
 state = {"devices": [], "updated": 0, "scanning": False, "subnet": ""}
 first_seen = {}
 
@@ -67,7 +102,7 @@ def scan():
                 continue
             first_seen.setdefault(mac if mac[0] != "(" else ip, now)
             devs.append({"ip": ip, "mac": mac, "name": names.get(ip, ""),
-                         "me": ip == me,
+                         "me": ip == me, "vendor": vendor(mac),
                          "private_mac": mac[1] in "26ae" if mac[0] != "(" else False,
                          "since": first_seen[mac if mac[0] != "(" else ip]})
         state["devices"], state["updated"] = devs, now
@@ -102,8 +137,8 @@ td.mono{font-family:ui-monospace,monospace;font-size:13px}
 <h1>Quién está en mi WiFi</h1>
 <div class="sub" id="sub">Escaneando…</div>
 <div class="top"><div><span class="count" id="n">–</span> dispositivos</div>
-<input id="q" placeholder="Filtrar por IP, MAC o nombre…"><button id="b">Escanear ahora</button></div>
-<table><thead><tr><th>IP</th><th>Nombre</th><th class="hide">MAC</th><th class="hide">Visto desde</th></tr></thead>
+<input id="q" placeholder="Filtrar por IP, MAC, nombre o fabricante…"><button id="b">Escanear ahora</button></div>
+<table><thead><tr><th>IP</th><th>Nombre</th><th>Fabricante</th><th class="hide">MAC</th><th class="hide">Visto desde</th></tr></thead>
 <tbody id="t"></tbody></table>
 <p class="sub">Una MAC “privada” es una dirección aleatoria que usan iPhone/Android para no ser rastreados. Si ves un dispositivo que no reconoces, cambia la clave del WiFi.</p>
 </main>
@@ -111,11 +146,11 @@ td.mono{font-family:ui-monospace,monospace;font-size:13px}
 let data=[];
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 function draw(){const q=document.getElementById('q').value.toLowerCase();
-const rows=data.devices.filter(d=>(d.ip+d.mac+d.name).toLowerCase().includes(q));
+const rows=data.devices.filter(d=>(d.ip+d.mac+d.name+d.vendor).toLowerCase().includes(q));
 document.getElementById('n').textContent=data.devices.length;
 document.getElementById('t').innerHTML=rows.map(d=>`<tr><td class="mono">${esc(d.ip)}${d.me?'<span class="tag">tú</span>':''}</td>
 <td>${esc(d.name||'Desconocido')}${d.private_mac?'<span class="tag">MAC privada</span>':''}</td>
-<td class="mono hide">${esc(d.mac)}</td><td class="hide">${new Date(d.since*1000).toLocaleTimeString()}</td></tr>`).join('');
+<td>${esc(d.vendor||'—')}</td><td class="mono hide">${esc(d.mac)}</td><td class="hide">${new Date(d.since*1000).toLocaleTimeString()}</td></tr>`).join('');
 document.getElementById('sub').textContent=(data.scanning?'Escaneando… ':'')+'Red '+data.subnet+(data.updated?' · actualizado '+new Date(data.updated*1000).toLocaleTimeString():'')}
 async function load(){data=await (await fetch('/api/devices')).json();draw()}
 document.getElementById('q').oninput=draw;
@@ -136,6 +171,7 @@ class H(BaseHTTPRequestHandler):
         threading.Thread(target=scan, daemon=True).start(); self.send("{}", "application/json")
 
 if __name__ == "__main__":
+    load_oui()
     threading.Thread(target=loop, daemon=True).start()
     print(f"Abre http://localhost:{PORT}  (Ctrl+C para salir)")
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
